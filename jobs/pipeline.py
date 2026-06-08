@@ -11,6 +11,13 @@ from pyspark.sql.functions import month, year
 from pyspark.sql.functions import unix_timestamp
 from datetime import datetime
 import json
+from pyspark.sql.functions import when
+from pyspark.sql.functions import broadcast
+import os
+import sys
+
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +41,55 @@ def get_spark():
         .getOrCreate()
     
     return spark  # build and return SparkSession
+
+
+EXPECTED_SCHEMA = {
+    "VendorID": "IntegerType",
+    "tpep_pickup_datetime": "TimestampType",
+    "tpep_dropoff_datetime": "TimestampType",
+    "passenger_count": "IntegerType",
+    "trip_distance": "FloatType",
+    "pickup_longitude": "FloatType",
+    "pickup_latitude": "FloatType",
+    "RateCodeID": "IntegerType",
+    "store_and_fwd_flag": "StringType",
+    "dropoff_longitude": "FloatType",
+    "dropoff_latitude": "FloatType",
+    "payment_type": "IntegerType",
+    "fare_amount": "FloatType",
+    "extra": "FloatType",
+    "mta_tax": "FloatType",
+    "tip_amount": "FloatType",
+    "tolls_amount": "FloatType",
+    "improvement_surcharge": "FloatType",
+    "total_amount": "FloatType"
+}
+
+def validate_schema(df):
+    actual_columns = set(df.columns)
+    expected_columns = set(EXPECTED_SCHEMA.keys())
+
+    missing = expected_columns - actual_columns
+    extra = actual_columns - expected_columns
+
+    if extra:
+        logger.warning(f"Extra columns detected: {extra}")
+
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    actual_types = {field.name: type(field.dataType).__name__ for field in df.schema.fields}
+
+    type_mismatches = {
+        col: f"expected {EXPECTED_SCHEMA[col]}, got {actual_types[col]}"
+        for col in EXPECTED_SCHEMA
+        if col in actual_types and actual_types[col] != EXPECTED_SCHEMA[col]
+    }
+
+    if type_mismatches:
+        raise ValueError(f"Type mismatches: {type_mismatches}")
+
+    logger.info("Schema validation passed.")
 
 def run_cleaning(spark):
     logger.info("Starting cleaning job...")
@@ -62,6 +118,7 @@ def run_cleaning(spark):
     ])
     
     df = spark.read.csv("data/raw/", header=True, schema=schema)
+    validate_schema(df)
 
     logger.info("Schema: ")
     df.printSchema()
@@ -156,6 +213,22 @@ def run_transforms(spark):
     logger.info("Starting transforms...")
     df = spark.read.parquet("../output/cleaned/")
 
+    # On local machines with limited RAM, a when/otherwise expression is used as an equivalent. Broadcast join is the production approach for small lookup tables.
+    # vendor_data = [
+    #     (1, "Creative Mobile Technologies"),
+    #     (2, "VeriFone Inc.")
+    # ]
+
+    # vendor_lookup = spark.createDataFrame(vendor_data, ["VendorID", "VendorName"])
+    
+    # df = df.join(broadcast(vendor_lookup), on="VendorID")
+
+    df = df.withColumn("VendorName",
+    when(col("VendorID") == 1, "Creative Mobile Technologies")
+    .when(col("VendorID") == 2, "VeriFone Inc.")
+    .otherwise("Unknown")
+    )
+
     revenue_by_vendor = df.groupBy("VendorID") \
     .agg(
         format_number(sum("total_amount"), 2).alias("total_revenue"),
@@ -164,6 +237,8 @@ def run_transforms(spark):
         count("*").alias("total_trips")
     )
 
+    logger.info("\nRevenue by vendor:")
+    revenue_by_vendor.show()
     
     hourly_demand = (
         df.groupBy(F.hour("tpep_pickup_datetime").alias("pickup_hour"))
