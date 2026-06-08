@@ -1,12 +1,26 @@
+import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.types import *
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
-from pyspark.sql.functions import round, avg, count, sum
+from pyspark.sql.functions import avg, count, sum
+from pyspark.sql.functions import round as spark_round
 from pyspark.sql.functions import format_number
 from pyspark.sql import functions as F
 from pyspark.sql.functions import month, year
 from pyspark.sql.functions import unix_timestamp
+from datetime import datetime
+import json
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("output/pipeline.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 def get_spark():
     existing = SparkSession.getActiveSession()
@@ -22,7 +36,7 @@ def get_spark():
     return spark  # build and return SparkSession
 
 def run_cleaning(spark):
-    print("Starting cleaning job...")
+    logger.info("Starting cleaning job...")
 
     schema = StructType([
 
@@ -49,11 +63,11 @@ def run_cleaning(spark):
     
     df = spark.read.csv("data/raw/", header=True, schema=schema)
 
-    print("Schema: ")
+    logger.info("Schema: ")
     df.printSchema()
     
-    print(f"Rows read: {df.count()}")
-    print(f"Columns: {len(df.columns)}")
+    logger.info(f"Rows read: {df.count()}")
+    logger.info(f"Columns: {len(df.columns)}")
 
     def filter_passengers(df):
         return df.filter(
@@ -107,9 +121,9 @@ def run_cleaning(spark):
 
     after = df.count()
 
-    print(f"Rows before cleaning: {before}")
-    print(f"Rows after cleaning:  {after}")
-    print(f"Rows removed:         {before - after}")
+    logger.info(f"Rows before cleaning: {before}")
+    logger.info(f"Rows after cleaning:  {after}")
+    logger.info(f"Rows removed:         {before - after}")
 
     df = df.withColumn("pickup_month", month(col("tpep_pickup_datetime"))) \
         .withColumn("pickup_year", year(col("tpep_pickup_datetime")))
@@ -121,26 +135,32 @@ def run_cleaning(spark):
     .mode("overwrite") \
     .parquet("../output/cleaned/")
 
-    print("Saved: output/cleaned/")
-    print("Cleaning done.")
+    logger.info("Saved: output/cleaned/")
+    logger.info("Cleaning done.")
 
     df_verify = spark.read.parquet("../output/cleaned/")
 
-    df_verify.groupBy("pickup_year", "pickup_month") \
+    partition_df  = df_verify.groupBy("pickup_year", "pickup_month") \
             .count() \
-            .orderBy("pickup_year", "pickup_month") \
-            .show()
+            .orderBy("pickup_year", "pickup_month") 
     
+    partition_df.show()
+    
+    partition_counts = {
+    f"{row['pickup_year']}-{row['pickup_month']}": row['count']
+    for row in partition_df.collect()}
+
+    generate_quality_report(before, after, partition_counts)
 
 def run_transforms(spark):
-    print("Starting transforms...")
+    logger.info("Starting transforms...")
     df = spark.read.parquet("../output/cleaned/")
 
     revenue_by_vendor = df.groupBy("VendorID") \
     .agg(
         format_number(sum("total_amount"), 2).alias("total_revenue"),
-        round(avg("fare_amount"), 2).alias("avg_fare"),
-        round(avg("tip_amount"), 2).alias("avg_tip"),
+        spark_round(avg("fare_amount"), 2).alias("avg_fare"),
+        spark_round(avg("tip_amount"), 2).alias("avg_tip"),
         count("*").alias("total_trips")
     )
 
@@ -171,7 +191,7 @@ def run_transforms(spark):
     avg_duration_minutes_by_hour = (
     duration_minutes
     .groupBy(F.hour("tpep_pickup_datetime").alias("pickup_hour"))
-    .agg(round(avg("trip_duration_minutes"), 2).alias("avg_duration_minutes"))
+    .agg(spark_round(avg("trip_duration_minutes"), 2).alias("avg_duration_minutes"))
     .orderBy("pickup_hour")
     )
 
@@ -181,21 +201,37 @@ def run_transforms(spark):
     .parquet("../output/aggregations/avg_duration_by_hour/")
 
 
-    print("Saved: output/aggregations/hourly_demand/")
-    print("Saved: output/aggregations/revenue_by_vendor/")
-    print("Saved: output/aggregations/avg_duration_by_hour/")
+    logger.info("Saved: output/aggregations/hourly_demand/")
+    logger.info("Saved: output/aggregations/revenue_by_vendor/")
+    logger.info("Saved: output/aggregations/avg_duration_by_hour/")
 
-    print("Transforms done.")   
+    logger.info("Transforms done.")   
 
-    print("\nRevenue by Vendor")
+    logger.info("\nRevenue by Vendor")
     revenue_by_vendor.show()
 
-    print("\nHourly Demand")
+    logger.info("\nHourly Demand")
     hourly_demand.show(24)
 
-    print("\navg duration minutes by hour")
+    logger.info("\navg duration minutes by hour")
     avg_duration_minutes_by_hour.show(24)
 
+def generate_quality_report(before, after, partition_counts):
+    current_time = datetime.now()
+
+    output = {
+        "run_timestamp": current_time,
+        "raw_row_count": before,
+        "cleaned_row_count": after,
+        "rows_removed": before - after,
+        "removal_percentage": round(((before - after) / before) * 100, 2),
+        "rows_per_partition": partition_counts
+    }
+
+    with open("output/quality_report.json", "w") as f:
+        json.dump(output, f, indent=4, default=str)
+
+    logger.info("Report Saved: output/quality_report.json")
 
 if __name__ == "__main__":
     spark = get_spark()
