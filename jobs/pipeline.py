@@ -38,6 +38,7 @@ def get_spark():
         .appName("TaxiPipeline") \
         .config("spark.driver.memory", "4g") \
         .config("spark.sql.shuffle.partitions", "8") \
+        .config("spark.local.dir", "C:/spark-temp") \
         .getOrCreate()
     
     return spark  # build and return SparkSession
@@ -90,6 +91,38 @@ def validate_schema(df):
         raise ValueError(f"Type mismatches: {type_mismatches}")
 
     logger.info("Schema validation passed.")
+
+def validate_outputs(spark):
+    try:
+        hourly_demand_df = spark.read.parquet("../output/aggregations/hourly_demand/")
+        revenue_by_vendor_df = spark.read.parquet("../output/aggregations/revenue_by_vendor/")
+        avg_duration_by_hour_df = spark.read.parquet("../output/aggregations/avg_duration_by_hour/")
+    except Exception as e:
+        raise LookupError(f"Could not read aggregation outputs: {e}")
+    
+    assert hourly_demand_df.count() == 24, \
+        f"hourly_demand should have 24 rows, got {hourly_demand_df.count()}"
+
+    assert revenue_by_vendor_df.count() == 2, \
+        f"revenue_by_vendor should have 2 rows, got {revenue_by_vendor_df.count()}"
+
+    assert avg_duration_by_hour_df.count() == 24, \
+        f"avg_duration_by_hour should have 24 rows, got {avg_duration_by_hour_df.count()}"
+
+    # pickup_hour range 0-23
+    invalid_hours = hourly_demand_df.filter(
+        (col("pickup_hour") < 0) | (col("pickup_hour") > 23)
+    ).count()
+    assert invalid_hours == 0, f"Invalid pickup_hour values found: {invalid_hours} rows"
+
+    # VendorID only 1 or 2
+    invalid_vendors = revenue_by_vendor_df.filter(
+        ~col("VendorID").isin([1, 2])
+    ).count()
+    assert invalid_vendors == 0, f"Unexpected VendorID values found"
+
+    logger.info("Transformation outputs have been validated.")
+
 
 def run_cleaning(spark):
     logger.info("Starting cleaning job...")
@@ -213,11 +246,12 @@ def run_transforms(spark):
     logger.info("Starting transforms...")
     df = spark.read.parquet("../output/cleaned/")
 
-    # On local machines with limited RAM, a when/otherwise expression is used as an equivalent. Broadcast join is the production approach for small lookup tables.
+    # On local machines with limited RAM, a when/otherwise expression is used as an equivalent. 
+    # Broadcast join is the production approach for small lookup tables.
     # vendor_data = [
     #     (1, "Creative Mobile Technologies"),
     #     (2, "VeriFone Inc.")
-    # ]
+    # ]  
 
     # vendor_lookup = spark.createDataFrame(vendor_data, ["VendorID", "VendorName"])
     
@@ -290,6 +324,8 @@ def run_transforms(spark):
 
     logger.info("\navg duration minutes by hour")
     avg_duration_minutes_by_hour.show(24)
+
+    validate_outputs(spark)
 
 def generate_quality_report(before, after, partition_counts):
     current_time = datetime.now()
